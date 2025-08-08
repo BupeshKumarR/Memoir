@@ -5,57 +5,93 @@ from chromadb.config import Settings
 import os
 from typing import List, Dict, Optional
 
-CHROMA_COLLECTION_NAME = "agent-memory"
-CHROMA_PERSIST_DIR = "./backend/memory/chroma_data"
+# Configuration
+PERSIST_DIRECTORY = "./backend/memory/chroma_data"
+COLLECTION_NAME = "memoir_memories"
 
 # Ensure the persist directory exists
-os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+os.makedirs(PERSIST_DIRECTORY, exist_ok=True)
 
-# Setup the ChromaDB client with persistence
-client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+# Global collection cache
+_collection_cache = None
 
 def get_collection():
-    """Get or create the memory collection"""
+    """Get or create the ChromaDB collection with proper dimension handling"""
+    global _collection_cache
+    
+    # Return cached collection if available
+    if _collection_cache is not None:
+        return _collection_cache
+    
+    client = chromadb.PersistentClient(path=PERSIST_DIRECTORY)
+    
     try:
-        collection = client.get_collection(name=CHROMA_COLLECTION_NAME)
-    except:
-        collection = client.create_collection(name=CHROMA_COLLECTION_NAME)
-    return collection
+        # Try to get existing collection
+        collection = client.get_collection(name=COLLECTION_NAME)
+        
+        # Check if collection has the right dimension
+        # We'll use a test embedding to check dimensions
+        from backend.llm.embedder import get_embedding
+        test_embedding = get_embedding("test")
+        
+        # If dimensions don't match, we need to recreate the collection
+        if len(test_embedding) != 384:  # Old dimension
+            print("⚠️  Detected dimension mismatch. Recreating collection for new embedding model...")
+            try:
+                client.delete_collection(name=COLLECTION_NAME)
+            except:
+                pass  # Collection might not exist
+            collection = client.create_collection(name=COLLECTION_NAME)
+            print("✅ Collection recreated with new dimensions")
+        
+        # Cache the collection
+        _collection_cache = collection
+        return collection
+        
+    except Exception as e:
+        # Collection doesn't exist or other error, create new one
+        print(f"Creating new collection: {e}")
+        try:
+            client.delete_collection(name=COLLECTION_NAME)
+        except:
+            pass  # Collection might not exist
+        collection = client.create_collection(name=COLLECTION_NAME)
+        _collection_cache = collection
+        return collection
 
 # Initialize collection
 collection = get_collection()
 
-def add_memory(memory_id: str, text: str, embedding: List[float], 
-               metadata: Dict = None):
-    """Stores a memory with its embedding and metadata."""
-    if metadata is None:
-        metadata = {}
+def add_memory(memory_id: str, text: str, embedding: list, metadata: dict):
+    """Add a memory to the collection"""
+    collection = get_collection()
     
     collection.add(
         documents=[text],
         embeddings=[embedding],
         metadatas=[metadata],
-        ids=[memory_id],
+        ids=[memory_id]
     )
 
-def query_memory(query_embedding: List[float], k: int = 5, 
-                where_filter: Dict = None) -> List[str]:
-    """Queries top k most relevant memories from ChromaDB."""
-    
-    query_kwargs = {
-        "query_embeddings": [query_embedding],
-        "n_results": k,
-        "include": ["documents", "distances", "metadatas", "ids"]
-    }
+def query_memory(query_embedding: list, top_k: int = 5, where_filter: dict = None):
+    """Query memories from the collection"""
+    collection = get_collection()
     
     if where_filter:
-        query_kwargs["where"] = where_filter
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            where=where_filter,
+            include=["documents", "metadatas", "distances"]
+        )
+    else:
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"]
+        )
     
-    results = collection.query(**query_kwargs)
-    
-    if results["documents"] and results["documents"][0]:
-        return results["documents"][0]
-    return []
+    return results
 
 def get_memory_by_id(memory_id: str) -> Optional[Dict]:
     """Get a specific memory by ID"""
@@ -166,26 +202,31 @@ def search_memories_with_metadata(query_embedding: List[float],
         print(f"Error searching memories: {e}")
         return []
 
-def get_collection_stats() -> Dict:
-    """Get statistics about the memory collection"""
-    try:
-        count = collection.count()
-        return {
-            "total_memories": count,
-            "collection_name": CHROMA_COLLECTION_NAME,
-            "persist_directory": CHROMA_PERSIST_DIR
-        }
-    except Exception as e:
-        print(f"Error getting collection stats: {e}")
-        return {"error": str(e)}
+def get_collection_stats():
+    """Get statistics about the collection"""
+    collection = get_collection()
+    count = collection.count()
+    return {
+        "total_memories": count,
+        "collection_name": COLLECTION_NAME,
+        "persist_directory": PERSIST_DIRECTORY
+    }
 
-def reset_collection() -> bool:
-    """Reset the entire memory collection (use with caution!)"""
+def reset_collection():
+    """Reset the collection (useful for testing or migration)"""
+    global _collection_cache
+    
+    client = chromadb.PersistentClient(path=PERSIST_DIRECTORY)
+    
     try:
-        client.delete_collection(name=CHROMA_COLLECTION_NAME)
-        global collection
-        collection = client.create_collection(name=CHROMA_COLLECTION_NAME)
-        return True
-    except Exception as e:
-        print(f"Error resetting collection: {e}")
-        return False
+        client.delete_collection(name=COLLECTION_NAME)
+        print("✅ Collection deleted")
+    except:
+        print("Collection didn't exist")
+    
+    # Clear cache
+    _collection_cache = None
+    
+    collection = client.create_collection(name=COLLECTION_NAME)
+    print("✅ New collection created")
+    return collection
