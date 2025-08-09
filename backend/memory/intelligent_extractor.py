@@ -4,12 +4,16 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from backend.llm.llm_client import extract_facts_and_preferences, determine_memory_operations
 from backend.memory.memory_manager import MemoryManager
+from backend.memory.intelligence import MemoryScorer, ConflictDetector, ConflictResolver, MemoryRecord
+from backend.memory.memory_types import MemoryType
 
 class IntelligentMemoryExtractor:
     """LLM-powered memory extraction and processing"""
     
     def __init__(self, memory_manager: MemoryManager):
         self.memory_manager = memory_manager
+        self.conflict_detector = ConflictDetector()
+        self.conflict_resolver = ConflictResolver()
     
     def extract_from_conversation(self, user_input: str, assistant_response: str) -> Dict[str, Any]:
         """Extract facts, preferences, and entities from conversation using LLM"""
@@ -27,96 +31,88 @@ class IntelligentMemoryExtractor:
         
         return extraction_result
     
-    def process_extracted_information(self, extraction_result: Dict[str, Any]) -> List[str]:
-        """Process extracted information and determine memory operations"""
-        
-        # Get existing memories for comparison
-        existing_memories = self.memory_manager.get_user_memories(limit=50)
-        
-        # Combine facts and preferences for processing
-        new_information = []
-        new_information.extend(extraction_result.get("facts", []))
-        new_information.extend(extraction_result.get("preferences", []))
-        
-        if not new_information:
-            return []
-        
-        # Determine operations using LLM
-        operations_result = determine_memory_operations(new_information, existing_memories)
-        
-        # Execute operations
-        processed_memories = []
-        for operation in operations_result.get("operations", []):
-            fact = operation.get("fact", "")
-            op_type = operation.get("operation", "ADD")
-            
-            if op_type == "ADD":
-                memory_id = self._add_new_memory(fact, extraction_result)
-                if memory_id:
-                    processed_memories.append(f"Added: {fact}")
-            
-            elif op_type == "UPDATE":
-                target_id = operation.get("target_memory_id")
-                if target_id:
-                    success = self._update_memory(target_id, fact, extraction_result)
-                    if success:
-                        processed_memories.append(f"Updated: {fact}")
-            
-            elif op_type == "DELETE":
-                target_id = operation.get("target_memory_id")
-                if target_id:
-                    success = self.memory_manager.delete_memory(target_id)
-                    if success:
-                        processed_memories.append(f"Deleted: {fact}")
-        
-        return processed_memories
+    def _build_candidate_records(self, extraction_result: Dict[str, Any]) -> List[MemoryRecord]:
+        """Convert extraction results into candidate records with types and importance"""
+        candidates: List[MemoryRecord] = []
+        context = {"is_user_explicit": True}
+        for text in extraction_result.get("facts", []) + extraction_result.get("preferences", []):
+            imp = MemoryScorer.calculate_importance(text, context)
+            mtype = MemoryScorer.classify_type(text).value
+            metadata = {
+                "memory_type": mtype,
+                "importance": imp,
+                "confidence": extraction_result.get("confidence", 1.0),
+                "extraction_method": "llm_powered"
+            }
+            candidates.append(MemoryRecord(id=None, content=text, metadata=metadata))
+        return candidates
     
-    def _add_new_memory(self, content: str, extraction_result: Dict[str, Any]) -> Optional[str]:
+    def process_extracted_information(self, extraction_result: Dict[str, Any]) -> List[str]:
+        """Process extracted information, resolve conflicts, and store selectively"""
+        existing_raw = self.memory_manager.get_user_memories(limit=200)
+        existing = [MemoryRecord(id=m.get("id"), content=m.get("content", ""), metadata=m.get("metadata", {})) for m in existing_raw]
+        
+        candidates = self._build_candidate_records(extraction_result)
+        processed: List[str] = []
+        
+        for cand in candidates:
+            # Skip low-importance candidates
+            if cand.metadata.get("importance", 0.0) < 0.4:
+                continue
+            # Detect conflicts
+            conflicts = self.conflict_detector.scan_for_conflicts(cand, existing)
+            if conflicts:
+                # Resolve the first conflict pragmatically
+                ctype, old_mem = conflicts[0]
+                if ctype == "preference_evolution":
+                    action = self.conflict_resolver.resolve_preference_evolution(old_mem, cand)
+                else:
+                    action = self.conflict_resolver.resolve_direct_contradiction(old_mem, cand)
+                op = action["operation"]
+                if op == "UPDATE" and old_mem.id:
+                    self.memory_manager.update_memory_metadata(old_mem.id, {"last_updated": datetime.now().isoformat(), "superseded_by": cand.content})
+                    processed.append(f"Updated: {cand.content}")
+                elif op == "DELETE" and old_mem.id:
+                    self.memory_manager.delete_memory(old_mem.id)
+                    processed.append(f"Deleted conflicting: {old_mem.content}")
+                # After resolution, add the new memory
+                mem_id = self._add_new_memory(cand.content, extraction_result, forced_type=cand.metadata.get("memory_type"), forced_importance=cand.metadata.get("importance"))
+                if mem_id:
+                    processed.append(f"Added: {cand.content}")
+                continue
+            
+            # No conflict: add directly
+            mem_id = self._add_new_memory(cand.content, extraction_result, forced_type=cand.metadata.get("memory_type"), forced_importance=cand.metadata.get("importance"))
+            if mem_id:
+                processed.append(f"Added: {cand.content}")
+        
+        return processed
+    
+    def _add_new_memory(self, content: str, extraction_result: Dict[str, Any], forced_type: Optional[str] = None, forced_importance: Optional[float] = None) -> Optional[str]:
         """Add new memory with enhanced metadata"""
         
         # Determine memory type based on content
-        memory_type = "fact"
-        if any(pref.lower() in content.lower() for pref in ["like", "love", "prefer", "enjoy", "hate", "don't like"]):
-            memory_type = "preference"
+        memory_type = forced_type or "fact"
+        if not forced_type:
+            if any(pref.lower() in content.lower() for pref in ["like", "love", "prefer", "enjoy", "hate", "don't like", "allergic"]):
+                memory_type = "preference"
         
         # Calculate importance based on extraction result
-        base_importance = extraction_result.get("importance_score", 1.0)
-        confidence = extraction_result.get("confidence", 1.0)
-        importance = base_importance * confidence
+        importance = forced_importance if forced_importance is not None else extraction_result.get("importance_score", 1.0) * extraction_result.get("confidence", 1.0)
         
         # Add entity information to metadata (convert lists to strings for ChromaDB)
         entities = extraction_result.get("entities", [])
         metadata = {
-            "entities": ", ".join(entities) if entities else "",  # Convert list to string
-            "confidence": confidence,
-            "extraction_method": "llm_powered"
+            "entities": ", ".join(entities) if entities else "",
+            "confidence": extraction_result.get("confidence", 1.0),
+            "extraction_method": "llm_powered",
+            "source_type": "explicit"
         }
         
         if memory_type == "preference":
             return self.memory_manager.add_preference_memory(content, importance)
         else:
             return self.memory_manager.add_fact_memory(content, importance, metadata)
-    
-    def _update_memory(self, memory_id: str, new_content: str, extraction_result: Dict[str, Any]) -> bool:
-        """Update existing memory with new information"""
-        
-        # Update metadata (convert lists to strings for ChromaDB)
-        entities = extraction_result.get("entities", [])
-        metadata_updates = {
-            "last_updated": datetime.now().isoformat(),
-            "entities": ", ".join(entities) if entities else "",  # Convert list to string
-            "confidence": extraction_result.get("confidence", 1.0),
-            "extraction_method": "llm_powered"
-        }
-        
-        # Update the memory content and metadata
-        success = self.memory_manager.update_memory_metadata(memory_id, metadata_updates)
-        
-        # Note: ChromaDB doesn't support direct content updates, so we'd need to delete and recreate
-        # For now, we'll just update metadata and log the content change
-        print(f"Memory {memory_id} content should be updated to: {new_content}")
-        
-        return success
 
 class MemoryOperationEngine:
     """Engine for processing memory operations"""
