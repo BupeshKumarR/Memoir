@@ -1,11 +1,13 @@
 # backend/agent.py
 import uuid
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Any
 from backend.llm.llm_client import get_completion
 from backend.memory.memory_manager import MemoryManager
 from backend.memory.intelligent_extractor import MemoryOperationEngine
 from backend.memory.advanced_retrieval import AdvancedMemoryRetrieval
+from backend.memory.lifecycle_manager import MemoryLifecycleManager
+from backend.memory.contextual_retrieval import ContextualRetrieval, ConversationContext
 import re
 
 class MemoryAgent:
@@ -18,13 +20,20 @@ class MemoryAgent:
         # Initialize new intelligent components
         self.memory_engine = MemoryOperationEngine(self.memory)
         self.advanced_retrieval = AdvancedMemoryRetrieval(self.memory)
+        
+        # Initialize new lifecycle and contextual components
+        self.lifecycle_manager = MemoryLifecycleManager(self.memory)
+        self.contextual_retrieval = ContextualRetrieval(self.memory, self.advanced_retrieval)
+        
+        # Initialize conversation context
+        self.conversation_context = ConversationContext()
     
     def process_user_input(self, user_input: str) -> str:
         """Process user input with enhanced memory retrieval and storage"""
         
-        # 1. Retrieve relevant memories with advanced scoring
-        relevant_memories = self.advanced_retrieval.retrieve_memories_advanced(
-            user_input, top_k=3, min_relevance=0.3
+        # 1. Retrieve relevant memories with contextual awareness
+        relevant_memories, retrieval_insights = self.contextual_retrieval.retrieve_for_context(
+            user_input, self.conversation_context, k=3
         )
         
         # 2. Build enhanced memory context
@@ -42,8 +51,15 @@ class MemoryAgent:
         # 6. Store conversation
         self._store_conversation(user_input, response)
         
-        # 7. Extract and store additional facts/preferences using LLM
+        # 7. Update conversation context
+        self.conversation_context.add_exchange(user_input, response)
+        
+        # 8. Extract and store additional facts/preferences using LLM
         self._extract_and_store_facts_intelligent(user_input, response)
+        
+        # 9. Log retrieval insights for debugging
+        if retrieval_insights:
+            print(f"🔍 Retrieval insights: {retrieval_insights}")
         
         return response
     
@@ -56,7 +72,7 @@ class MemoryAgent:
         for i, memory in enumerate(memories, 1):
             content = memory.get('content', '')
             metadata = memory.get('metadata', {})
-            relevance_score = memory.get('advanced_relevance_score', memory.get('similarity_score', 0.0))
+            relevance_score = memory.get('final_relevance_score', memory.get('advanced_relevance_score', memory.get('similarity_score', 0.0)))
             memory_type = metadata.get('memory_type', 'conversation')
             importance = metadata.get('importance', 1.0)
             confidence = metadata.get('confidence', 1.0)
@@ -70,9 +86,13 @@ class MemoryAgent:
                 context_parts.append(f"{i}. [CONVERSATION - {relevance_score:.2f}] {content}")
             
             # Add entity information if available
-            entities = metadata.get('entities', [])
+            entities = metadata.get('entities', '')
             if entities:
-                context_parts.append(f"   Entities: {', '.join(entities)}")
+                context_parts.append(f"   Entities: {entities}")
+            
+            # Add importance and confidence if available
+            if importance != 1.0 or confidence != 1.0:
+                context_parts.append(f"   Importance: {importance:.2f}, Confidence: {confidence:.2f}")
         
         return "\n".join(context_parts)
     
@@ -193,13 +213,17 @@ Assistant:"""
         # Get memory analytics
         analytics = self.memory_engine.get_memory_analytics()
         
+        # Get memory health metrics
+        health_metrics = self.lifecycle_manager.get_memory_health_metrics(self.user_id)
+        
         return {
             "user_id": self.user_id,
             "preferences": [p.get('content', '') for p in preferences],
             "facts": [f.get('content', '') for f in facts],
             "recent_conversations": len(recent_conversations),
             "total_memories": len(self.memory.get_user_memories()),
-            "memory_analytics": analytics
+            "memory_analytics": analytics,
+            "memory_health": health_metrics
         }
     
     def search_memories(self, query: str, memory_type: str = None, top_k: int = 5) -> List[Dict]:
@@ -218,6 +242,12 @@ Assistant:"""
         print(f"Search insights: {insights}")
         
         return memories
+    
+    def search_memories_contextual(self, query: str, top_k: int = 5) -> Tuple[List[Dict], Dict]:
+        """Search memories with contextual awareness"""
+        return self.contextual_retrieval.retrieve_for_context(
+            query, self.conversation_context, k=top_k
+        )
     
     def add_custom_memory(self, content: str, memory_type: str = "fact", importance: float = 1.0):
         """Add a custom memory"""
@@ -244,16 +274,46 @@ Assistant:"""
         # Get advanced analytics
         analytics = self.memory_engine.get_memory_analytics()
         
+        # Get memory health metrics
+        health_metrics = self.lifecycle_manager.get_memory_health_metrics(self.user_id)
+        
         return {
             "total_memories": len(all_memories),
             "memory_types": type_counts,
             "user_id": self.user_id,
             "session_id": self.session_id,
-            "advanced_analytics": analytics
+            "advanced_analytics": analytics,
+            "memory_health": health_metrics
         }
     
     def get_memory_insights(self, query: str) -> Dict:
         """Get detailed insights about memory retrieval for a query"""
         memories = self.advanced_retrieval.retrieve_memories_advanced(query, top_k=5)
         return self.advanced_retrieval.get_memory_insights(query, memories)
+    
+    async def run_memory_maintenance(self) -> Dict[str, Any]:
+        """Run memory maintenance tasks (consolidation, expiration, etc.)"""
+        print("🔄 Running memory maintenance...")
+        return await self.lifecycle_manager.daily_maintenance(self.user_id)
+    
+    def get_memory_health(self) -> Dict[str, Any]:
+        """Get comprehensive memory health metrics"""
+        return self.lifecycle_manager.get_memory_health_metrics(self.user_id)
+    
+    def set_user_goals(self, goals: List[str]):
+        """Set active user goals for contextual retrieval"""
+        self.conversation_context.active_goals = goals
+        print(f"🎯 Set user goals: {goals}")
+    
+    def get_conversation_context(self) -> Dict[str, Any]:
+        """Get current conversation context analysis"""
+        topic_analysis = self.conversation_context.analyze_topic_flow()
+        return {
+            "current_topic": topic_analysis.get("current_topic", "general"),
+            "topic_coherence": topic_analysis.get("coherence", 0.0),
+            "topic_shifts": topic_analysis.get("topic_shift", 0),
+            "active_goals": self.conversation_context.active_goals,
+            "session_duration": (datetime.now() - self.conversation_context.session_start).total_seconds(),
+            "conversation_exchanges": len(self.conversation_context.conversation_history)
+        }
 

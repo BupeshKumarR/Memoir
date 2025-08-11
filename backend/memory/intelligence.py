@@ -107,14 +107,26 @@ class TemporalManager:
         if not timestamp_str:
             return 1.0
         try:
-            ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        except Exception:
-            ts = datetime.now()
-        days_old = max(0, (now - ts).days)
-        mtype = metadata.get("memory_type", MemoryType.CONVERSATION)
-        half_life = DECAY_HALF_LIFE_DAYS.get(MemoryType(mtype), 90)
-        decay_rate = math.log(2) / half_life
-        return math.exp(-decay_rate * days_old)
+            # Handle timezone-aware and naive timestamps
+            if timestamp_str.endswith('Z'):
+                timestamp_str = timestamp_str[:-1] + '+00:00'
+            
+            ts = datetime.fromisoformat(timestamp_str)
+            
+            # Make both timestamps timezone-naive for comparison
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            if now.tzinfo is not None:
+                now = now.replace(tzinfo=None)
+            
+            days_old = max(0, (now - ts).days)
+            mtype = metadata.get("memory_type", MemoryType.CONVERSATION)
+            half_life = DECAY_HALF_LIFE_DAYS.get(MemoryType(mtype), 90)
+            decay_rate = math.log(2) / half_life
+            return math.exp(-decay_rate * days_old)
+        except Exception as e:
+            print(f"Warning: Error calculating decay strength: {e}")
+            return 1.0
 
     @staticmethod
     def access_boost(access_count: int) -> float:
